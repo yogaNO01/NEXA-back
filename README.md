@@ -7,7 +7,7 @@ cd /Users/zhangmingchun/Documents/web/backend
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 创建 `.env`（或在运行环境中提供同名变量）：
@@ -34,7 +34,7 @@ cp .env.example .env
 docker compose up -d mysql
 ```
 
-前端设置 `VITE_API_BASE_URL=http://localhost:8000` 后即可调用。
+局域网开发时，前端设置 `VITE_API_BASE_URL=http://192.168.5.56:8000`；后端设置 `NEXA_CORS_ORIGINS=http://192.168.5.56:5175`（多个来源用逗号分隔）。后端必须以 `--host 0.0.0.0` 启动，且防火墙需要允许局域网访问 TCP 8000。
 
 公开接口：
 

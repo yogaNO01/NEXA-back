@@ -9,6 +9,7 @@ import secrets
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 import pymysql
@@ -35,14 +36,26 @@ MYSQL = {
     "database": os.getenv("MYSQL_DATABASE", "nexa_portal"),
     "charset": "utf8mb4",
 }
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5175,"
+    "http://127.0.0.1:5175,"
+    "http://192.168.5.56:5175"
+)
+CORS_ORIGINS = [origin.strip() for origin in os.getenv("NEXA_CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",") if origin.strip()]
+# Development machines may be reached through different private-network adapters.
+# Keep the explicit allow-list above, and allow only localhost/private LAN origins
+# (with any dev-server port) through this regex.
+CORS_ORIGIN_REGEX = os.getenv(
+    "NEXA_CORS_ORIGIN_REGEX",
+    r"^https?://(localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}|198\.18(?:\.\d{1,3}){2})(?::\d+)?$",
+)
 
 app = FastAPI(title="NEXA Content API", version="0.1.0")
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.add_middleware(
     CORSMiddleware,
-    # Vite selects the next available port during local development, so allow
-    # every localhost port while keeping the policy limited to this machine.
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_methods=["*"], allow_headers=["*"],
 )
 bearer = HTTPBearer(auto_error=False)
@@ -147,11 +160,12 @@ def init_db() -> None:
         statements = [
           """CREATE TABLE IF NOT EXISTS solution_groups (id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(80) NOT NULL, sort_order INT NOT NULL DEFAULT 0, published BOOLEAN NOT NULL DEFAULT TRUE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
           """CREATE TABLE IF NOT EXISTS solutions (id BIGINT PRIMARY KEY AUTO_INCREMENT, group_id BIGINT NOT NULL, name VARCHAR(100) NOT NULL, slug VARCHAR(100) NOT NULL UNIQUE, icon VARCHAR(100) NOT NULL DEFAULT '', cover_image VARCHAR(2048) NOT NULL DEFAULT '', summary TEXT NOT NULL, sort_order INT NOT NULL DEFAULT 0, published BOOLEAN NOT NULL DEFAULT FALSE, detail_json JSON NOT NULL, CONSTRAINT fk_solutions_group FOREIGN KEY(group_id) REFERENCES solution_groups(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
-          """CREATE TABLE IF NOT EXISTS content_items (id BIGINT PRIMARY KEY AUTO_INCREMENT, kind VARCHAR(20) NOT NULL, category VARCHAR(100), title VARCHAR(200) NOT NULL, slug VARCHAR(120) NOT NULL, summary TEXT NOT NULL, body LONGTEXT NOT NULL, featured BOOLEAN NOT NULL DEFAULT FALSE, published BOOLEAN NOT NULL DEFAULT FALSE, sort_order INT NOT NULL DEFAULT 0, UNIQUE KEY uq_content_kind_slug(kind,slug)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+          """CREATE TABLE IF NOT EXISTS content_items (id BIGINT PRIMARY KEY AUTO_INCREMENT, kind VARCHAR(20) NOT NULL, category VARCHAR(100), title VARCHAR(200) NOT NULL, slug VARCHAR(120) NOT NULL, summary TEXT NOT NULL, body LONGTEXT NOT NULL, image_url VARCHAR(2048) NOT NULL DEFAULT '', published_at DATETIME NULL, featured BOOLEAN NOT NULL DEFAULT FALSE, published BOOLEAN NOT NULL DEFAULT FALSE, sort_order INT NOT NULL DEFAULT 0, UNIQUE KEY uq_content_kind_slug(kind,slug)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
           """CREATE TABLE IF NOT EXISTS content_categories (id BIGINT PRIMARY KEY AUTO_INCREMENT, kind VARCHAR(20) NOT NULL, name VARCHAR(80) NOT NULL, slug VARCHAR(100) NOT NULL, sort_order INT NOT NULL DEFAULT 0, published BOOLEAN NOT NULL DEFAULT TRUE, UNIQUE KEY uq_category_kind_slug(kind,slug)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
           """CREATE TABLE IF NOT EXISTS leads (id BIGINT PRIMARY KEY AUTO_INCREMENT, company VARCHAR(200) NOT NULL, name VARCHAR(100) NOT NULL, contact VARCHAR(200) NOT NULL, type VARCHAR(100) NOT NULL, description TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
           """CREATE TABLE IF NOT EXISTS tickets (id BIGINT PRIMARY KEY AUTO_INCREMENT, company VARCHAR(200) NOT NULL, name VARCHAR(100) NOT NULL, contact VARCHAR(200) NOT NULL, type VARCHAR(100) NOT NULL, level VARCHAR(50) NOT NULL DEFAULT 'P3 一般问题', description TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
           """CREATE TABLE IF NOT EXISTS admin_users (id BIGINT PRIMARY KEY AUTO_INCREMENT, username VARCHAR(80) NOT NULL UNIQUE, password_hash VARCHAR(256) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+          """CREATE TABLE IF NOT EXISTS content_imports (name VARCHAR(100) PRIMARY KEY, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
         ]
         for statement in statements: conn.execute(statement)
         if conn.execute("SELECT COUNT(*) AS total FROM admin_users").fetchone()["total"] == 0 and ADMIN_USERNAME and ADMIN_PASSWORD:
@@ -162,12 +176,20 @@ def init_db() -> None:
             ensure_column(conn, table, "assignee", "VARCHAR(100) NOT NULL DEFAULT ''")
             ensure_column(conn, table, "notes", "TEXT NOT NULL")
             ensure_column(conn, table, "updated_at", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
+        ensure_column(conn, "content_items", "published_at", "DATETIME NULL")
+        ensure_column(conn, "content_items", "image_url", "VARCHAR(2048) NOT NULL DEFAULT ''")
+        conn.execute("UPDATE content_items SET published_at=CURRENT_TIMESTAMP WHERE kind='news' AND published_at IS NULL")
         if conn.execute("SELECT COUNT(*) AS total FROM solution_groups").fetchone()["total"] == 0:
             conn.executemany("INSERT INTO solution_groups(name, sort_order, published) VALUES (?, ?, 1)", [("空间行业", 1), ("能源与工业", 2)])
             group_ids = {row["name"]: row["id"] for row in conn.execute("SELECT id,name FROM solution_groups")}
             seed_solutions(conn, group_ids)
+        migrate_solution_architectures(conn)
         if conn.execute("SELECT COUNT(*) AS total FROM content_items").fetchone()["total"] == 0:
             seed_content(conn)
+        import_reference_cases(conn)
+        import_reference_news(conn)
+        import_reference_news_supplement(conn)
+        migrate_news_categories(conn)
 
 
 def seed_solutions(conn: Connection, group_ids: dict[str, int]) -> None:
@@ -193,13 +215,35 @@ def default_detail(name: str, summary: str, image: str) -> dict[str, Any]:
     return {
         "hero": {"title": name, "description": summary, "image": image},
         "capabilities": [{"title": x, "text": f"围绕{name}的真实业务现场，提供可组合、可持续运营的标准能力。", "icon": f"0{i}"} for i, x in enumerate(["设备连接", "运营管理", "数据洞察", "开放集成"], 1)],
-        "architecture": {"title": f"{name}系统架构", "background": image, "layers": [{"name": "业务应用", "items": ["运营中心", "移动应用", "管理驾驶舱"]}, {"name": "平台服务", "items": ["设备管理", "规则引擎", "数据服务", "工单"]}, {"name": "边缘连接", "items": ["协议接入", "本地联动", "边缘计算"]}, {"name": "现场设备", "items": ["传感器", "控制器", "网关", "业务设备"]}]},
+        "architecture": default_architecture(name, image),
         "advantages": ["统一数据底座", "可复制交付", "开放集成", "持续运营"],
         "scenarios": [{"name": x, "description": f"通过{x}将设备、人员与运营流程连接起来，实现可量化的业务改善。", "image": image, "features": ["实时数据", "规则联动", "告警闭环"]} for x in ["设备运营", "业务协同", "能效优化"]],
         "flow": ["需求诊断", "方案设计", "部署集成", "持续运营"],
         "faq": [{"q": "方案是否支持现有系统集成？", "a": "支持通过标准 API、协议与实施服务对接现有设备及业务系统。"}],
         "cta": {"title": f"构建可持续运营的{name}", "text": "与解决方案专家沟通项目背景、业务目标和实施节奏。", "action": "联系方案专家"},
     }
+
+
+def default_architecture(name: str, image: str) -> dict[str, Any]:
+    return {"title": f"{name}系统架构", "background": image, "layers": [
+        {"name": "业务应用", "items": ["运营中心", "移动应用", "管理驾驶舱"]},
+        {"name": "平台服务", "items": ["设备管理", "规则引擎", "数据服务", "工单"]},
+        {"name": "边缘连接", "items": ["协议接入", "本地联动", "边缘计算"]},
+        {"name": "现场设备", "items": ["传感器", "控制器", "网关", "业务设备"]},
+    ]}
+
+
+def migrate_solution_architectures(conn: Connection) -> None:
+    """Persist the legacy architecture shown by the front end into solution JSON.
+
+    Do not touch the user-created 测试222 record, nor an intentionally empty
+    architecture: an empty layer list means the public page should hide it.
+    """
+    for row in conn.execute("SELECT id,name,cover_image,detail_json FROM solutions WHERE name<>?", ("测试222",)):
+        detail = json.loads(row["detail_json"]) if isinstance(row["detail_json"], str) else row["detail_json"]
+        if "architecture" not in detail:
+            detail["architecture"] = default_architecture(row["name"], row["cover_image"])
+            conn.execute("UPDATE solutions SET detail_json=? WHERE id=?", (json_value(detail), row["id"]))
 
 
 def seed_content(conn: Connection) -> None:
@@ -213,6 +257,77 @@ def seed_content(conn: Connection) -> None:
     ]
     conn.executemany("""INSERT INTO content_items(kind,category,title,slug,summary,body,featured,published,sort_order)
     VALUES(?,?,?,?,?,?,?,?,?)""", items)
+
+
+def import_reference_cases(conn: Connection) -> None:
+    """Import the supplied HTML project's home-page cases exactly once."""
+    import_name = "project2-full-optimized-v14-cases"
+    if conn.execute("SELECT 1 FROM content_imports WHERE name=?", (import_name,)).fetchone():
+        return
+    cases = [
+        ("华东 · 智能制造", "生产设备联网与车间可视化", "factory-visibility", "接入 PLC、传感器与产线设备，统一采集状态、告警和能耗数据，支撑设备运维与生产分析。", "https://images.unsplash.com/photo-1565043666747-69f6646db940?auto=format&fit=crop&w=1600&q=86", 1),
+        ("商业园区 · 楼宇", "多楼栋设备统一运营", "building-operations", "照明、空调、门禁、能耗和工单统一纳管。", "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?auto=format&fit=crop&w=1400&q=86", 2),
+        ("酒店 · 客房", "客房场景与节能联动", "hotel-guestroom", "入住、离房、睡眠等场景自动联动灯光、空调与服务。", "https://images.unsplash.com/photo-1611892440504-42a792e24d32?auto=format&fit=crop&w=1400&q=86", 3),
+    ]
+    for category, title, slug, summary, image_url, sort_order in cases:
+        conn.execute("""INSERT INTO content_items(kind,category,title,slug,summary,body,image_url,featured,published,sort_order)
+        VALUES('cases',?,?,?,?,?,?,1,1,?)
+        ON DUPLICATE KEY UPDATE category=VALUES(category),title=VALUES(title),summary=VALUES(summary),body=VALUES(body),image_url=VALUES(image_url),featured=1,published=1,sort_order=VALUES(sort_order)""", (category, title, slug, summary, summary, image_url, sort_order))
+    conn.execute("INSERT INTO content_imports(name) VALUES(?)", (import_name,))
+
+
+def import_reference_news(conn: Connection) -> None:
+    """Import the three news stories and matching visuals from the HTML reference once."""
+    import_name = "project2-full-optimized-v14-news-v2"
+    if conn.execute("SELECT 1 FROM content_imports WHERE name=?", (import_name,)).fetchone():
+        return
+    # Replace only the original placeholder news seeded by this project; do not
+    # touch news created by an editor.
+    conn.execute("DELETE FROM content_items WHERE kind='news' AND slug IN ('edge-upgrade','operations-practice')")
+    news = [
+        ("产品", "边缘网关 3.2 正式上线，新增断网续传与批量配置", "edge-gateway-3-2", "面向楼宇和工业现场优化弱网环境下的数据采集与远程运维。", "2026-09-05 09:00:00", "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=1400&q=86", 1),
+        ("项目", "某连锁酒店客房智能化项目完成首批门店交付", "hotel-rollout", "覆盖客控、空调、门锁状态与能耗策略，统一接入运营平台。", "2026-08-21 09:00:00", "https://images.unsplash.com/photo-1611892440504-42a792e24d32?auto=format&fit=crop&w=1400&q=86", 2),
+        ("技术", "设备日志与告警中心完成版本升级", "device-log-upgrade", "新增错误聚合、设备链路追踪和批量诊断能力。", "2026-08-03 09:00:00", "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1400&q=86", 3),
+    ]
+    for category, title, slug, summary, published_at, image_url, sort_order in news:
+        conn.execute("""INSERT INTO content_items(kind,category,title,slug,summary,body,image_url,published_at,featured,published,sort_order)
+        VALUES('news',?,?,?,?,?,?,?,1,1,?)
+        ON DUPLICATE KEY UPDATE category=VALUES(category),title=VALUES(title),summary=VALUES(summary),body=VALUES(body),image_url=VALUES(image_url),published_at=VALUES(published_at),featured=1,published=1,sort_order=VALUES(sort_order)""", (category, title, slug, summary, summary, image_url, published_at, sort_order))
+    conn.execute("INSERT INTO content_imports(name) VALUES(?)", (import_name,))
+
+
+def import_reference_news_supplement(conn: Connection) -> None:
+    """Add the fourth latest-news item shown in the HTML reference's sidebar."""
+    import_name = "project2-full-optimized-v14-news-supplement"
+    if conn.execute("SELECT 1 FROM content_imports WHERE name=?", (import_name,)).fetchone():
+        return
+    conn.execute("""INSERT INTO content_items(kind,category,title,slug,summary,body,image_url,published_at,featured,published,sort_order)
+    VALUES('news',?,?,?,?,?,?,?,1,1,4)
+    ON DUPLICATE KEY UPDATE category=VALUES(category),title=VALUES(title),summary=VALUES(summary),body=VALUES(body),image_url=VALUES(image_url),published_at=VALUES(published_at),featured=1,published=1,sort_order=4""", (
+        "行业实践", "从设备联网到生产分析：制造现场如何构建可持续运营的数据链路", "manufacturing-data-link",
+        "围绕设备接入、边缘计算、告警与运维建立统一技术底座。", "围绕设备接入、边缘计算、告警与运维建立统一技术底座。",
+        "https://images.unsplash.com/photo-1565043666747-69f6646db940?auto=format&fit=crop&w=1400&q=86", "2026-07-18 09:00:00",
+    ))
+    conn.execute("INSERT INTO content_imports(name) VALUES(?)", (import_name,))
+
+
+def migrate_news_categories(conn: Connection) -> None:
+    """Create category records for every existing named news category once."""
+    known_names = {row["name"] for row in conn.execute("SELECT name FROM content_categories WHERE kind='news'")}
+    known_slugs = {row["slug"] for row in conn.execute("SELECT slug FROM content_categories WHERE kind='news'")}
+    names = [row["category"].strip() for row in conn.execute("SELECT DISTINCT category FROM content_items WHERE kind='news' AND category IS NOT NULL AND TRIM(category)<>'' ORDER BY category")]
+    next_number = 1
+    for name in names:
+        if name in known_names:
+            continue
+        slug = f"news-category-{next_number}"
+        while slug in known_slugs:
+            next_number += 1
+            slug = f"news-category-{next_number}"
+        conn.execute("INSERT INTO content_categories(kind,name,slug,sort_order,published) VALUES(?,?,?,?,1)", ("news", name, slug, next_number))
+        known_names.add(name)
+        known_slugs.add(slug)
+        next_number += 1
 
 
 class GroupInput(BaseModel):
@@ -239,6 +354,8 @@ class ContentInput(BaseModel):
     slug: str = Field(pattern=r"^[a-z0-9-]+$")
     summary: str = ""
     body: str = ""
+    image_url: str = Field(default="", max_length=2048)
+    published_at: datetime | None = None
     featured: bool = False
     published: bool = False
     sort_order: int = 0
@@ -328,14 +445,20 @@ def public_solution_detail(slug: str) -> dict[str, Any]:
 @app.post("/api/leads", status_code=status.HTTP_201_CREATED)
 def create_lead(payload: LeadInput) -> dict[str, int]:
     with db() as conn:
-        cursor = conn.execute("INSERT INTO leads(company,name,contact,type,description) VALUES(?,?,?,?,?)", (payload.company, payload.name, payload.contact, payload.type, payload.description))
+        cursor = conn.execute(
+            "INSERT INTO leads(company,name,contact,type,description,workflow_status,assignee,notes) VALUES(?,?,?,?,?,?,?,?)",
+            (payload.company, payload.name, payload.contact, payload.type, payload.description, "待处理", "", ""),
+        )
         return {"id": cursor.lastrowid}
 
 
 @app.post("/api/tickets", status_code=status.HTTP_201_CREATED)
 def create_ticket(payload: TicketInput) -> dict[str, int]:
     with db() as conn:
-        cursor = conn.execute("INSERT INTO tickets(company,name,contact,type,level,description) VALUES(?,?,?,?,?,?)", (payload.company, payload.name, payload.contact, payload.type, payload.level, payload.description))
+        cursor = conn.execute(
+            "INSERT INTO tickets(company,name,contact,type,level,description,workflow_status,assignee,notes) VALUES(?,?,?,?,?,?,?,?,?)",
+            (payload.company, payload.name, payload.contact, payload.type, payload.level, payload.description, "待处理", "", ""),
+        )
         return {"id": cursor.lastrowid}
 
 
@@ -442,14 +565,25 @@ def admin_solutions() -> list[dict[str, Any]]:
 
 
 def save_solution(payload: SolutionInput, solution_id: int | None = None) -> dict[str, Any]:
-    detail = payload.detail or default_detail(payload.name, payload.summary, payload.cover_image)
+    # The admin may submit only the blocks it exposes as structured fields.
+    # Keep all other detail-page blocks available by filling them from defaults.
+    detail = {**default_detail(payload.name, payload.summary, payload.cover_image), **(payload.detail or {})}
+    faq = detail.get("faq") if isinstance(detail, dict) else None
+    if faq is not None and (
+        not isinstance(faq, list)
+        or any(not isinstance(item, dict) or not str(item.get("q", "")).strip() or not str(item.get("a", "")).strip() for item in faq)
+    ):
+        raise HTTPException(422, "每条常见问题的问题和答案都不能为空")
     with db() as conn:
         if solution_id is None:
             cursor = conn.execute("""INSERT INTO solutions(group_id,name,slug,icon,cover_image,summary,sort_order,published,detail_json)
             VALUES(?,?,?,?,?,?,?,?,?)""", (payload.group_id,payload.name,payload.slug,payload.icon,payload.cover_image,payload.summary,payload.sort_order,payload.published,json_value(detail)))
             return {"id": cursor.lastrowid}
         changed = conn.execute("""UPDATE solutions SET group_id=?,name=?,slug=?,icon=?,cover_image=?,summary=?,sort_order=?,published=?,detail_json=? WHERE id=?""", (payload.group_id,payload.name,payload.slug,payload.icon,payload.cover_image,payload.summary,payload.sort_order,payload.published,json_value(detail),solution_id)).rowcount
-    if not changed: raise HTTPException(404, "行业方案不存在")
+        # MySQL reports 0 affected rows when an existing record is saved without
+        # changing any values. Check existence separately before treating it as 404.
+        exists = changed or conn.execute("SELECT 1 FROM solutions WHERE id=?", (solution_id,)).fetchone()
+    if not exists: raise HTTPException(404, "行业方案不存在")
     return {"ok": True}
 
 
@@ -489,23 +623,28 @@ def admin_content(kind: Literal["news", "cases", "help"]) -> list[dict[str, Any]
 @app.post("/api/admin/{kind}", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
 def create_content(kind: Literal["news", "cases", "help"], payload: ContentInput) -> dict[str, int]:
     with db() as conn:
-        cursor = conn.execute("INSERT INTO content_items(kind,category,title,slug,summary,body,featured,published,sort_order) VALUES(?,?,?,?,?,?,?,?,?)", (kind,payload.category,payload.title,payload.slug,payload.summary,payload.body,payload.featured,payload.published,payload.sort_order))
+        cursor = conn.execute("INSERT INTO content_items(kind,category,title,slug,summary,body,image_url,published_at,featured,published,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (kind,payload.category,payload.title,payload.slug,payload.summary,payload.body,payload.image_url,payload.published_at if kind == "news" else None,payload.featured,payload.published,payload.sort_order))
         return {"id": cursor.lastrowid}
 
 
 @app.put("/api/admin/{kind}/{item_id}", dependencies=[Depends(require_admin)])
 def update_content(kind: Literal["news", "cases", "help"], item_id: int, payload: ContentInput) -> dict[str, bool]:
     with db() as conn:
-        changed = conn.execute("""UPDATE content_items SET category=?,title=?,slug=?,summary=?,body=?,featured=?,published=?,sort_order=?
-        WHERE id=? AND kind=?""", (payload.category,payload.title,payload.slug,payload.summary,payload.body,payload.featured,payload.published,payload.sort_order,item_id,kind)).rowcount
+        changed = conn.execute("""UPDATE content_items SET category=?,title=?,slug=?,summary=?,body=?,image_url=?,published_at=?,featured=?,published=?,sort_order=?
+        WHERE id=? AND kind=?""", (payload.category,payload.title,payload.slug,payload.summary,payload.body,payload.image_url,payload.published_at if kind == "news" else None,payload.featured,payload.published,payload.sort_order,item_id,kind)).rowcount
     if not changed: raise HTTPException(404, "内容不存在")
     return {"ok": True}
 
 
 @app.delete("/api/admin/{kind}/{item_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_admin)])
-def delete_content(kind: Literal["news", "cases", "help"], item_id: int) -> None:
-    with db() as conn: changed = conn.execute("DELETE FROM content_items WHERE id=? AND kind=?", (item_id, kind)).rowcount
-    if not changed: raise HTTPException(404, "内容不存在")
+def delete_record(kind: Literal["news", "cases", "help", "leads", "tickets"], item_id: int) -> None:
+    with db() as conn:
+        if kind in {"leads", "tickets"}:
+            changed = conn.execute(f"DELETE FROM {kind} WHERE id=?", (item_id,)).rowcount
+        else:
+            changed = conn.execute("DELETE FROM content_items WHERE id=? AND kind=?", (item_id, kind)).rowcount
+    if not changed:
+        raise HTTPException(404, "记录不存在")
 
 
 @app.get("/api/admin/categories/{kind}/items", dependencies=[Depends(require_admin)])
